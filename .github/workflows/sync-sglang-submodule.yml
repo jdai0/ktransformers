@@ -14,6 +14,8 @@ jobs:
   sync:
     name: Check for sglang-kt updates
     runs-on: ubuntu-latest
+    env:
+      SYNC_PR_TOKEN: ${{ secrets.SGLANG_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -21,7 +23,7 @@ jobs:
         with:
           submodules: true
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ env.SYNC_PR_TOKEN }}
 
       - name: Update sglang submodule to latest main
         id: update
@@ -54,9 +56,11 @@ jobs:
 
       - name: Create pull request
         if: steps.update.outputs.changed == 'true'
+        id: create_pr
         uses: peter-evans/create-pull-request@v6
+        continue-on-error: true
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ env.SYNC_PR_TOKEN }}
           commit-message: |
             [build]: sync sglang submodule to ${{ steps.update.outputs.new_sha }}
           branch: auto/sync-sglang
@@ -79,3 +83,9 @@ jobs:
           labels: |
             dependencies
             automated
+
+      - name: Warn if PR could not be created automatically
+        if: steps.update.outputs.changed == 'true' && steps.create_pr.outcome == 'failure'
+        run: |
+          echo "::warning::Failed to create/update pull request automatically."
+          echo "::warning::If repository settings disallow pull request creation with GITHUB_TOKEN, set the SGLANG_SYNC_TOKEN secret to a PAT with repo permissions."
