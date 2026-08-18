@@ -70,11 +70,39 @@ class KTMoELayerWrapper(nn.Module):
         setattr(self, experts_attr, getattr(original_moe, experts_attr, None))
         self._experts_attr = experts_attr
 
-        # 3. shared_experts (if any)
-        if moe_config.has_shared_experts and hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
-        else:
-            self.shared_experts = None
+        # 3. shared expert path (if any). Keep the architecture-specific
+        # attribute names so state_dict keys and module traversal remain
+        # identical to the original HF MoE block. Qwen uses the singular
+        # `shared_expert` plus a learned `shared_expert_gate`; DeepSeek uses
+        # `shared_experts` without that gate.
+        self._shared_expert_attr: str | None = None
+        self._shared_expert_gate_attr: str | None = None
+        if moe_config.has_shared_experts:
+            shared_expert_attr = moe_config.shared_expert_attr
+            if not shared_expert_attr:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: architecture declares shared experts "
+                    "but MOEArchConfig.shared_expert_attr is unset"
+                )
+            shared_expert = getattr(original_moe, shared_expert_attr, None)
+            if shared_expert is None:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: expected shared expert attribute "
+                    f"{shared_expert_attr!r} on {type(original_moe).__name__}"
+                )
+            setattr(self, shared_expert_attr, shared_expert)
+            self._shared_expert_attr = shared_expert_attr
+
+            shared_expert_gate_attr = moe_config.shared_expert_gate_attr
+            if shared_expert_gate_attr:
+                shared_expert_gate = getattr(original_moe, shared_expert_gate_attr, None)
+                if shared_expert_gate is None:
+                    raise RuntimeError(
+                        f"Layer {layer_idx}: expected shared expert gate attribute "
+                        f"{shared_expert_gate_attr!r} on {type(original_moe).__name__}"
+                    )
+                setattr(self, shared_expert_gate_attr, shared_expert_gate)
+                self._shared_expert_gate_attr = shared_expert_gate_attr
 
         # 4. lora_experts (separate LoRA expert MLPs, different from PEFT LoRA on experts)
         self.lora_experts = lora_experts
@@ -123,9 +151,7 @@ class KTMoELayerWrapper(nn.Module):
         if _checkpoint_hook_mode() == "first_forward":
             save_for_backward_submit = False
 
-        if train_lora and self._lora_pointers_dirty:
-            self.update_lora_pointers()
-            self._lora_pointers_dirty = False
+        self._refresh_lora_pointers_if_dirty()
 
         gpu_output, all_qlens = self._submit_and_compute_gpu(
             hidden_states,
@@ -277,6 +303,20 @@ class KTMoELayerWrapper(nn.Module):
             topk_weights = topk_weights.to(torch.bfloat16)
             return topk_ids, topk_weights
 
+    def _compute_shared_expert_output(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Run the architecture-specific shared expert path exactly as HF does."""
+        if self._shared_expert_attr is None:
+            return None
+
+        shared_expert = getattr(self, self._shared_expert_attr)
+        shared_output = shared_expert(hidden_states)
+
+        if self._shared_expert_gate_attr is not None:
+            shared_expert_gate = getattr(self, self._shared_expert_gate_attr)
+            shared_output = torch.sigmoid(shared_expert_gate(hidden_states)) * shared_output
+
+        return shared_output
+
     def _submit_and_compute_gpu(
         self,
         hidden_states: torch.Tensor,
@@ -343,9 +383,8 @@ class KTMoELayerWrapper(nn.Module):
                 )
 
             # Keep shared/lora experts local to avoid qlen_max-style amplification.
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
+            gpu_output = self._compute_shared_expert_output(hidden_states)
+            if gpu_output is not None:
                 gpu_output = gpu_output.to(dtype=original_dtype)
 
             if self.lora_experts is not None:
@@ -371,15 +410,24 @@ class KTMoELayerWrapper(nn.Module):
                 save_for_backward=save_for_backward,
             )
 
-            # GPU compute: shared_experts + lora_experts
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
+            # GPU compute: shared expert path + lora_experts
+            gpu_output = self._compute_shared_expert_output(hidden_states)
             if self.lora_experts is not None:
                 lora_out = self.lora_experts(hidden_states)
                 gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
 
             return gpu_output, None
+
+    def _refresh_lora_pointers_if_dirty(self) -> bool:
+        """Refresh packed LoRA weights before the first forward after a step."""
+        has_peft_lora = self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0
+        has_fused_lora = getattr(self, "_fused_expert_lora_params", None) is not None
+        if not self._lora_pointers_dirty or not (has_peft_lora or has_fused_lora):
+            return False
+
+        self.update_lora_pointers()
+        self._lora_pointers_dirty = False
+        return True
 
     def update_lora_pointers(self):
         """Sync PEFT LoRA weights to C++ kernel after optimizer update."""

@@ -56,6 +56,8 @@ class MOEArchConfig:
     intermediate_size: int
     num_experts_per_tok: int
     has_shared_experts: bool = False
+    shared_expert_attr: str | None = None
+    shared_expert_gate_attr: str | None = None
     router_type: str = "linear"
 
 
@@ -84,6 +86,7 @@ def get_moe_arch_config(config) -> MOEArchConfig:
             intermediate_size=config.moe_intermediate_size,
             num_experts_per_tok=config.num_experts_per_tok,
             has_shared_experts=getattr(config, "n_shared_experts", 0) > 0,
+            shared_expert_attr="shared_experts",
             router_type="deepseek_gate",
         )
     if "DeepseekV3" in arch:
@@ -96,6 +99,7 @@ def get_moe_arch_config(config) -> MOEArchConfig:
             intermediate_size=config.moe_intermediate_size,
             num_experts_per_tok=config.num_experts_per_tok,
             has_shared_experts=getattr(config, "n_shared_experts", 0) > 0,
+            shared_expert_attr="shared_experts",
             router_type="deepseek_gate",
         )
     if "Qwen2Moe" in arch or "Qwen3Moe" in arch or "Qwen3_5Moe" in arch:
@@ -109,6 +113,8 @@ def get_moe_arch_config(config) -> MOEArchConfig:
             intermediate_size=cfg.moe_intermediate_size,
             num_experts_per_tok=cfg.num_experts_per_tok,
             has_shared_experts=getattr(cfg, "shared_expert_intermediate_size", 0) > 0,
+            shared_expert_attr="shared_expert",
+            shared_expert_gate_attr="shared_expert_gate",
         )
     if "Mixtral" in arch:
         return MOEArchConfig(
@@ -247,8 +253,17 @@ def move_non_experts_to_gpu(
         if router is not None:
             router.to(device)
 
-        if hasattr(moe_module, "shared_experts") and moe_module.shared_experts is not None:
-            moe_module.shared_experts.to(device)
+        shared_expert_attr = moe_config.shared_expert_attr
+        if shared_expert_attr:
+            shared_expert = getattr(moe_module, shared_expert_attr, None)
+            if shared_expert is not None:
+                shared_expert.to(device)
+
+        shared_expert_gate_attr = moe_config.shared_expert_gate_attr
+        if shared_expert_gate_attr:
+            shared_expert_gate = getattr(moe_module, shared_expert_gate_attr, None)
+            if shared_expert_gate is not None:
+                shared_expert_gate.to(device)
 
     logger.info(f"Moved non-expert parameters to {device}")
 

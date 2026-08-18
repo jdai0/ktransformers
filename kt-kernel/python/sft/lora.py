@@ -647,13 +647,16 @@ def save_kt_moe_to_adapter(model: nn.Module, output_dir: str) -> None:
     has_lora_experts = any(w.lora_experts is not None for w in wrappers)
     has_fused_lora = any(getattr(w, "_fused_expert_lora_params", None) is not None for w in wrappers)
 
-    if has_lora_experts:
-        save_lora_experts_to_adapter(model, output_dir)
-
     if has_fused_lora:
+        if has_lora_experts:
+            logger.info(
+                "[save_kt_moe] Fused expert LoRA is authoritative; "
+                "skipping legacy lora_experts serialization"
+            )
         _save_fused_expert_lora(wrappers, output_dir)
-
-    if not has_lora_experts and not has_fused_lora:
+    elif has_lora_experts:
+        save_lora_experts_to_adapter(model, output_dir)
+    else:
         logger.info("[save_kt_moe] No lora_experts or fused expert LoRA in KT wrappers")
 
 
