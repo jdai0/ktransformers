@@ -690,6 +690,7 @@ def _load_fused_expert_lora(wrappers: list, adapter_path: str) -> None:
     names = ["gate_lora_a", "gate_lora_b", "up_lora_a", "up_lora_b", "down_lora_a", "down_lora_b"]
     wrapper_map = {w.layer_idx: w for w in wrappers}
     loaded_count = 0
+    dirty_layers = set()
 
     for key, tensor in saved.items():
         parts = key.split(".")
@@ -711,6 +712,16 @@ def _load_fused_expert_lora(wrappers: list, adapter_path: str) -> None:
         param_idx = names.index(name)
         fused[param_idx].data.copy_(tensor)
         loaded_count += 1
+
+        # gate/up LoRA B and down LoRA A are copied into TP-partitioned C++
+        # buffers.  Loading the published tensors in-place updates the Python
+        # source buffers, but those partitioned copies remain stale until the
+        # wrapper refreshes them.  Mark the layer dirty so the first forward
+        # performs the existing synchronous update_lora_weights() path.
+        dirty_layers.add(layer_idx)
+
+    for layer_idx in dirty_layers:
+        wrapper_map[layer_idx]._lora_pointers_dirty = True
 
     logger.info(f"[_load_fused_expert_lora] Loaded {loaded_count} tensors from {path}")
 

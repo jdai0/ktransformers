@@ -68,6 +68,24 @@ static inline void print_tp_bf16_stats(int layer_idx, const char* name, const gg
          stats.abs_mean, stats.abs_max, stats.norm);
 }
 
+static inline uint64_t kt_routed_trace_fnv1a64(const void* data, size_t size) {
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  uint64_t value = 1469598103934665603ULL;
+  for (size_t i = 0; i < size; i++) {
+    value ^= static_cast<uint64_t>(bytes[i]);
+    value *= 1099511628211ULL;
+  }
+  return value;
+}
+
+static inline int kt_routed_trace_env_int(const char* name, int fallback) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') return fallback;
+  char* end = nullptr;
+  long parsed = std::strtol(raw, &end, 10);
+  return (end != raw && *end == '\0') ? static_cast<int>(parsed) : fallback;
+}
+
 // Forward declaration
 template <class T, template <class> class BaseMOE, bool SkipLoRA>
 class AMX_SFT_MOE_TP;
@@ -215,6 +233,7 @@ class TP_MOE_SFT : public TP_MOE<T> {
   std::vector<ggml_bf16_t*> part_grad_up_lora_a_;
   std::vector<ggml_bf16_t*> part_grad_input_;
   std::vector<float*> part_grad_weights_;
+  uint64_t routed_trace_call_ = 0;
 
  public:
   TP_MOE_SFT(const MOESFTConfig& config) : Base(static_cast<const GeneralMOEConfig&>(config)), sft_config(config) {
@@ -492,6 +511,30 @@ class TP_MOE_SFT : public TP_MOE<T> {
 
     int qlen = *qlen_ptr;
     auto pool = config.pool;
+    const int trace_layer = kt_routed_trace_env_int("KT_ROUTED_TRACE_LAYER", -1);
+    const int trace_token = kt_routed_trace_env_int("KT_ROUTED_TRACE_TOKEN", -1);
+    const char* trace_armed = std::getenv("KT_ROUTED_TRACE_ARMED");
+    const bool trace_active = trace_armed != nullptr && std::strcmp(trace_armed, "1") == 0 &&
+                              config.layer_idx == trace_layer && trace_token >= 0 && trace_token < qlen;
+    const uint64_t trace_call = trace_active ? ++routed_trace_call_ : 0;
+
+    if (trace_active) {
+      const auto* token_input = static_cast<const ggml_bf16_t*>(input) +
+                                static_cast<size_t>(trace_token) * config.hidden_size;
+      const auto* token_ids = expert_ids + static_cast<size_t>(trace_token) * k;
+      const auto* token_weights = weights + static_cast<size_t>(trace_token) * k;
+      std::printf(
+          "KT_ROUTED_BOUNDARY call=%llu layer=%d token=%d boundary=gather_input "
+          "input_fnv=%016llx ids_fnv=%016llx weights_fnv=%016llx qlen=%d k=%d\n",
+          static_cast<unsigned long long>(trace_call), config.layer_idx, trace_token,
+          static_cast<unsigned long long>(kt_routed_trace_fnv1a64(
+              token_input, static_cast<size_t>(config.hidden_size) * sizeof(ggml_bf16_t))),
+          static_cast<unsigned long long>(kt_routed_trace_fnv1a64(
+              token_ids, static_cast<size_t>(k) * sizeof(int64_t))),
+          static_cast<unsigned long long>(kt_routed_trace_fnv1a64(
+              token_weights, static_cast<size_t>(k) * sizeof(float))), qlen, k);
+      std::fflush(stdout);
+    }
 
     // Reset forward timing before computation
     // Reset per-thread counters in each subpool (to accumulate all do_work_stealing_job calls)
@@ -504,6 +547,19 @@ class TP_MOE_SFT : public TP_MOE<T> {
                                 save_for_backward);
     });
 
+    if (trace_active) {
+      for (int numa_id = 0; numa_id < tp_count; numa_id++) {
+        const float* partial = local_output_numa[numa_id] +
+                               static_cast<size_t>(trace_token) * tp_configs[numa_id].hidden_size;
+        std::printf(
+            "KT_ROUTED_BOUNDARY call=%llu layer=%d token=%d boundary=numa_partial numa=%d fnv=%016llx\n",
+            static_cast<unsigned long long>(trace_call), config.layer_idx, trace_token, numa_id,
+            static_cast<unsigned long long>(kt_routed_trace_fnv1a64(
+                partial, static_cast<size_t>(tp_configs[numa_id].hidden_size) * sizeof(float))));
+      }
+      std::fflush(stdout);
+    }
+
 
     // // Collect per-thread timing from all NUMA subpools
     // for (int i = 0; i < tp_count; i++) {
@@ -513,6 +569,17 @@ class TP_MOE_SFT : public TP_MOE<T> {
 
     // Merge results from all NUMA nodes
     this->merge_results(qlen, output);
+
+    if (trace_active) {
+      const auto* merged = static_cast<const ggml_bf16_t*>(output) +
+                           static_cast<size_t>(trace_token) * config.hidden_size;
+      std::printf(
+          "KT_ROUTED_BOUNDARY call=%llu layer=%d token=%d boundary=tp_merged fnv=%016llx\n",
+          static_cast<unsigned long long>(trace_call), config.layer_idx, trace_token,
+          static_cast<unsigned long long>(kt_routed_trace_fnv1a64(
+              merged, static_cast<size_t>(config.hidden_size) * sizeof(ggml_bf16_t))));
+      std::fflush(stdout);
+    }
 
 
     pool->dispense_backend()->do_numa_job([&](int numa_id) {

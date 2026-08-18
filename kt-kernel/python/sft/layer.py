@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -70,11 +73,39 @@ class KTMoELayerWrapper(nn.Module):
         setattr(self, experts_attr, getattr(original_moe, experts_attr, None))
         self._experts_attr = experts_attr
 
-        # 3. shared_experts (if any)
-        if moe_config.has_shared_experts and hasattr(original_moe, "shared_experts"):
-            self.shared_experts = original_moe.shared_experts
-        else:
-            self.shared_experts = None
+        # 3. shared expert path (if any). Keep the architecture-specific
+        # attribute names so state_dict keys and module traversal remain
+        # identical to the original HF MoE block. Qwen uses the singular
+        # `shared_expert` plus a learned `shared_expert_gate`; DeepSeek uses
+        # `shared_experts` without that gate.
+        self._shared_expert_attr: str | None = None
+        self._shared_expert_gate_attr: str | None = None
+        if moe_config.has_shared_experts:
+            shared_expert_attr = moe_config.shared_expert_attr
+            if not shared_expert_attr:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: architecture declares shared experts "
+                    "but MOEArchConfig.shared_expert_attr is unset"
+                )
+            shared_expert = getattr(original_moe, shared_expert_attr, None)
+            if shared_expert is None:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: expected shared expert attribute "
+                    f"{shared_expert_attr!r} on {type(original_moe).__name__}"
+                )
+            setattr(self, shared_expert_attr, shared_expert)
+            self._shared_expert_attr = shared_expert_attr
+
+            shared_expert_gate_attr = moe_config.shared_expert_gate_attr
+            if shared_expert_gate_attr:
+                shared_expert_gate = getattr(original_moe, shared_expert_gate_attr, None)
+                if shared_expert_gate is None:
+                    raise RuntimeError(
+                        f"Layer {layer_idx}: expected shared expert gate attribute "
+                        f"{shared_expert_gate_attr!r} on {type(original_moe).__name__}"
+                    )
+                setattr(self, shared_expert_gate_attr, shared_expert_gate)
+                self._shared_expert_gate_attr = shared_expert_gate_attr
 
         # 4. lora_experts (separate LoRA expert MLPs, different from PEFT LoRA on experts)
         self.lora_experts = lora_experts
@@ -123,9 +154,7 @@ class KTMoELayerWrapper(nn.Module):
         if _checkpoint_hook_mode() == "first_forward":
             save_for_backward_submit = False
 
-        if train_lora and self._lora_pointers_dirty:
-            self.update_lora_pointers()
-            self._lora_pointers_dirty = False
+        self._refresh_lora_pointers_if_dirty()
 
         gpu_output, all_qlens = self._submit_and_compute_gpu(
             hidden_states,
@@ -207,6 +236,58 @@ class KTMoELayerWrapper(nn.Module):
                 if self.wrapper is None:
                     raise RuntimeError("Rank0 wrapper is required in distributed KT overlap path.")
                 cpu_output = self.wrapper.sync_forward(output_device=original_device)
+                repeat_layer = int(os.environ.get("KT_ROUTED_SELF_REPEAT_LAYER", "-1"))
+                if self.layer_idx == repeat_layer:
+                    if getattr(self, "_kt_routed_repeat_save_for_backward", True):
+                        raise RuntimeError("KT routed self-repeat is inference-only")
+                    repeat_inputs = getattr(self, "_kt_routed_repeat_inputs", None)
+                    if repeat_inputs is None:
+                        raise RuntimeError("KT routed self-repeat has no frozen gathered inputs")
+                    first_output = cpu_output.clone()
+                    self.wrapper.submit_forward(*repeat_inputs, save_for_backward=False)
+                    second_output = self.wrapper.sync_forward(output_device=original_device)
+                    torch.cuda.synchronize(original_device)
+                    first_cpu = first_output.detach().cpu().contiguous()
+                    second_cpu = second_output.detach().cpu().contiguous()
+                    delta = first_cpu.float() - second_cpu.float()
+                    trace_token = int(os.environ.get("KT_ROUTED_TRACE_TOKEN", "-1"))
+                    if not 0 <= trace_token < int(first_cpu.shape[0]):
+                        raise RuntimeError(
+                            f"KT routed self-repeat token {trace_token} outside output {tuple(first_cpu.shape)}"
+                        )
+
+                    def sha256_tensor(value: torch.Tensor) -> str:
+                        return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+                    selected_delta = delta[trace_token]
+                    report = {
+                        "schema": 1,
+                        "layer": self.layer_idx,
+                        "global_token": trace_token,
+                        "qlen": int(first_cpu.shape[0]),
+                        "first_sha256": sha256_tensor(first_cpu),
+                        "second_sha256": sha256_tensor(second_cpu),
+                        "exact": bool(torch.equal(first_cpu, second_cpu)),
+                        "mae": float(delta.abs().mean()),
+                        "max_abs": float(delta.abs().max()),
+                        "selected_first_sha256": sha256_tensor(first_cpu[trace_token]),
+                        "selected_second_sha256": sha256_tensor(second_cpu[trace_token]),
+                        "selected_exact": bool(torch.equal(first_cpu[trace_token], second_cpu[trace_token])),
+                        "selected_mae": float(selected_delta.abs().mean()),
+                        "selected_max_abs": float(selected_delta.abs().max()),
+                    }
+                    output_path = os.environ.get("KT_ROUTED_SELF_REPEAT_OUTPUT")
+                    if not output_path:
+                        raise RuntimeError("KT_ROUTED_SELF_REPEAT_OUTPUT is required")
+                    target = Path(output_path)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_suffix(target.suffix + ".tmp")
+                    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    os.replace(temporary, target)
+                    cpu_output = first_output
+                    os.environ.pop("KT_ROUTED_TRACE_ARMED", None)
+                    del self._kt_routed_repeat_inputs
+                    del self._kt_routed_repeat_save_for_backward
                 cpu_output = cpu_output.to(dtype=original_dtype).view(total_qlen, self.hidden_size)
                 offsets = _qlen_offsets(all_qlens_list)
                 scatter_list = [cpu_output[offsets[i] : offsets[i + 1]].contiguous() for i in range(world_size)]
@@ -277,6 +358,20 @@ class KTMoELayerWrapper(nn.Module):
             topk_weights = topk_weights.to(torch.bfloat16)
             return topk_ids, topk_weights
 
+    def _compute_shared_expert_output(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Run the architecture-specific shared expert path exactly as HF does."""
+        if self._shared_expert_attr is None:
+            return None
+
+        shared_expert = getattr(self, self._shared_expert_attr)
+        shared_output = shared_expert(hidden_states)
+
+        if self._shared_expert_gate_attr is not None:
+            shared_expert_gate = getattr(self, self._shared_expert_gate_attr)
+            shared_output = torch.sigmoid(shared_expert_gate(hidden_states)) * shared_output
+
+        return shared_output
+
     def _submit_and_compute_gpu(
         self,
         hidden_states: torch.Tensor,
@@ -335,17 +430,24 @@ class KTMoELayerWrapper(nn.Module):
                 all_hs = torch.cat(gathered_hs, dim=0)
                 all_ids = torch.cat(gathered_ids, dim=0)
                 all_wts = torch.cat(gathered_wts, dim=0)
+                repeat_layer = int(os.environ.get("KT_ROUTED_SELF_REPEAT_LAYER", "-1"))
+                if self.layer_idx == repeat_layer:
+                    os.environ["KT_ROUTED_TRACE_ARMED"] = "1"
                 self.wrapper.submit_forward(
                     all_hs,
                     all_ids,
                     all_wts,
                     save_for_backward=save_for_backward,
                 )
+                if self.layer_idx == repeat_layer:
+                    if hasattr(self, "_kt_routed_repeat_inputs"):
+                        raise RuntimeError("KT routed self-repeat inputs were not consumed by the previous forward")
+                    self._kt_routed_repeat_inputs = (all_hs.detach(), all_ids.detach(), all_wts.detach())
+                    self._kt_routed_repeat_save_for_backward = bool(save_for_backward)
 
             # Keep shared/lora experts local to avoid qlen_max-style amplification.
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
+            gpu_output = self._compute_shared_expert_output(hidden_states)
+            if gpu_output is not None:
                 gpu_output = gpu_output.to(dtype=original_dtype)
 
             if self.lora_experts is not None:
@@ -371,15 +473,24 @@ class KTMoELayerWrapper(nn.Module):
                 save_for_backward=save_for_backward,
             )
 
-            # GPU compute: shared_experts + lora_experts
-            gpu_output = None
-            if self.shared_experts is not None:
-                gpu_output = self.shared_experts(hidden_states)
+            # GPU compute: shared expert path + lora_experts
+            gpu_output = self._compute_shared_expert_output(hidden_states)
             if self.lora_experts is not None:
                 lora_out = self.lora_experts(hidden_states)
                 gpu_output = lora_out if gpu_output is None else gpu_output + lora_out
 
             return gpu_output, None
+
+    def _refresh_lora_pointers_if_dirty(self) -> bool:
+        """Refresh packed LoRA weights before the first forward after a step."""
+        has_peft_lora = self._peft_lora_modules is not None and len(self._peft_lora_modules) > 0
+        has_fused_lora = getattr(self, "_fused_expert_lora_params", None) is not None
+        if not self._lora_pointers_dirty or not (has_peft_lora or has_fused_lora):
+            return False
+
+        self.update_lora_pointers()
+        self._lora_pointers_dirty = False
+        return True
 
     def update_lora_pointers(self):
         """Sync PEFT LoRA weights to C++ kernel after optimizer update."""
